@@ -1,3 +1,13 @@
+"""Sistema de Rotas entre Cidades — Teoria dos Grafos.
+
+Abas:
+  1. Calcular Rota  — seleciona origem/destino e executa Dijkstra.
+  2. Gerenciar      — adiciona/remove cidades e estradas (manual ou via mapa real).
+  3. Adjacência     — lista e matriz de adjacência do grafo.
+"""
+
+from __future__ import annotations
+
 import json
 import math
 from pathlib import Path
@@ -12,510 +22,832 @@ from mapas import ErroMapa, ServicoMapas, ServidorMapa, gerar_mapa
 
 
 ARQUIVO_DADOS = Path(__file__).with_name("rotas.json")
+
 CRITERIOS = {
     "Menor distância (km)": "distancia",
-    "Menor custo (R$)": "custo",
-    "Menor tempo (min)": "tempo",
+    "Menor tempo (min)":    "tempo",
 }
-UNIDADES = {"distancia": "km", "custo": "R$", "tempo": "min"}
+
+UNIDADES = {"distancia": "km", "tempo": "min"}
 
 
-def numero(valor):
+# ---------------------------------------------------------------------------
+# Utilidades
+# ---------------------------------------------------------------------------
+
+def fmt(valor: float) -> str:
+    """Número com 2 casas decimais no padrão pt-BR (vírgula decimal)."""
     return f"{valor:.2f}".replace(".", ",")
 
 
+def parse_float(texto: str, campo: str) -> float:
+    """Converte texto com vírgula/ponto para float >= 0 ou levanta ValueError."""
+    try:
+        v = float(texto.strip().replace(",", "."))
+    except (ValueError, AttributeError, OverflowError):
+        raise ValueError(f"Valor inválido para «{campo}».")
+    if not math.isfinite(v) or v < 0:
+        raise ValueError(f"«{campo}» deve ser um número positivo.")
+    return v
+
+
+def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Distância em km entre dois pontos geográficos (linha reta sobre a Terra)."""
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
+    return R * 2 * math.asin(math.sqrt(a))
+
+
+# ---------------------------------------------------------------------------
+# Aplicação
+# ---------------------------------------------------------------------------
+
 class Aplicacao:
-    def __init__(self, janela, arquivo=ARQUIVO_DADOS):
+    """Interface gráfica com 3 abas: Rota | Gerenciar | Adjacência."""
+
+    def __init__(self, janela: tk.Tk, arquivo: Path | str = ARQUIVO_DADOS) -> None:
         self.janela = janela
         self.arquivo = Path(arquivo)
         self.grafo = Grafo()
         self.servico_mapas = ServicoMapas()
-        self.servidor_mapa = None
-        self.fila_mapa = Queue()
+        self.servidor_mapa: ServidorMapa | None = None
+        self.fila_mapa: Queue = Queue()
         self.ocupado_mapa = False
         self.ultima_rota = None
+        self.resultados_busca: list[dict] = []
+        self._geometria_pendente: tuple | None = None
+        self._consulta_estrada_seq = 0
+
         if self.arquivo.exists():
-            self.grafo = Grafo.de_dict(
-                json.loads(self.arquivo.read_text(encoding="utf-8"))
-            )
+            try:
+                self.grafo = Grafo.de_dict(
+                    json.loads(self.arquivo.read_text(encoding="utf-8"))
+                )
+            except Exception as e:
+                print(f"Aviso ao carregar {self.arquivo.name}: {e}")
 
-        janela.title("Sistema de Rotas entre Cidades")
-        janela.geometry("1040x720")
-        janela.minsize(880, 620)
-        estilo = ttk.Style(janela)
-        estilo.theme_use("clam")
-        estilo.configure("TLabel", font=("Segoe UI", 10))
-        estilo.configure("TButton", font=("Segoe UI", 10), padding=7)
-        estilo.configure("Treeview", font=("Segoe UI", 10), rowheight=27)
-        estilo.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
-        estilo.configure("Titulo.TLabel", font=("Segoe UI", 21, "bold"))
-        estilo.configure("Resumo.TLabel", font=("Segoe UI", 12))
+        janela.title("Rotas entre Cidades — Dijkstra")
+        janela.geometry("1000x680")
+        janela.minsize(860, 580)
+        self._estilos(janela)
 
-        corpo = ttk.Frame(janela, padding=20)
+        corpo = ttk.Frame(janela, padding=14)
         corpo.pack(fill="both", expand=True)
-        ttk.Label(corpo, text="Rotas entre cidades", style="Titulo.TLabel").pack(
-            anchor="w"
-        )
+
+        # Título
+        ttk.Label(corpo, text="Sistema de Rotas", style="Titulo.TLabel").pack(anchor="w")
         ttk.Label(
-            corpo, text="Pesquise cidades no mapa ou cadastre sua própria rede de estradas."
-        ).pack(anchor="w", pady=(4, 16))
+            corpo,
+            text="Gerencie cidades e estradas, depois calcule a melhor rota pelo algoritmo de Dijkstra.",
+        ).pack(anchor="w", pady=(2, 10))
 
-        abas = ttk.Notebook(corpo)
-        abas.pack(fill="both", expand=True)
-        cadastro = ttk.Frame(abas, padding=16)
-        rotas = ttk.Frame(abas, padding=16)
-        adjacencia = ttk.Frame(abas, padding=16)
-        mapa = ttk.Frame(abas, padding=16)
-        abas.add(mapa, text="  Mapa e cidades reais  ")
-        abas.add(cadastro, text="  Cidades e estradas  ")
-        abas.add(rotas, text="  Melhor rota  ")
-        abas.add(adjacencia, text="  Lista e matriz de adjacência  ")
+        # ---- Abas ----
+        nb = ttk.Notebook(corpo)
+        nb.pack(fill="both", expand=True)
 
-        self.seletores_cidades = []
-        self.criar_cadastro(cadastro)
-        self.criar_rotas(rotas)
-        self.criar_adjacencia(adjacencia)
-        self.criar_mapa(mapa)
+        self._seletores: list[ttk.Combobox] = []
+
+        aba_rota   = ttk.Frame(nb, padding=14)
+        aba_ger    = ttk.Frame(nb, padding=14)
+        aba_adj    = ttk.Frame(nb, padding=14)
+
+        nb.add(aba_rota, text="  📍 Calcular Rota  ")
+        nb.add(aba_ger,  text="  🏙️ Gerenciar Cidades e Estradas  ")
+        nb.add(aba_adj,  text="  📊 Adjacência do Grafo  ")
+
+        self._aba_rota(aba_rota)
+        self._aba_gerenciar(aba_ger)
+        self._aba_adjacencia(aba_adj)
+
+        # Status bar
         self.status = tk.StringVar()
-        ttk.Label(corpo, textvariable=self.status).pack(anchor="w", pady=(12, 0))
-        self.atualizar()
-        self.janela.protocol("WM_DELETE_WINDOW", self.fechar)
+        ttk.Label(corpo, textvariable=self.status, foreground="#666").pack(anchor="w", pady=(8, 0))
 
-    def seletor_cidade(self, pai, titulo, coluna):
-        ttk.Label(pai, text=titulo).grid(row=0, column=coluna, sticky="w")
-        seletor = ttk.Combobox(pai, state="readonly", width=23)
-        seletor.grid(row=1, column=coluna, sticky="ew", padx=(0, 12), pady=(5, 12))
-        pai.columnconfigure(coluna, weight=1)
-        self.seletores_cidades.append(seletor)
-        return seletor
+        self._atualizar()
+        janela.protocol("WM_DELETE_WINDOW", self._fechar)
 
-    @staticmethod
-    def tabela(pai, colunas, altura=8):
-        quadro = ttk.Frame(pai)
-        quadro.pack(fill="both", expand=True)
-        tabela = ttk.Treeview(quadro, columns=tuple(colunas), show="headings", height=altura)
-        for chave, titulo in colunas.items():
-            tabela.heading(chave, text=titulo)
-            tabela.column(chave, width=120, minwidth=70, anchor="w")
-        vertical = ttk.Scrollbar(quadro, orient="vertical", command=tabela.yview)
-        horizontal = ttk.Scrollbar(quadro, orient="horizontal", command=tabela.xview)
-        tabela.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
-        tabela.grid(row=0, column=0, sticky="nsew")
-        vertical.grid(row=0, column=1, sticky="ns")
-        horizontal.grid(row=1, column=0, sticky="ew")
-        quadro.rowconfigure(0, weight=1)
-        quadro.columnconfigure(0, weight=1)
-        return tabela
+    # -----------------------------------------------------------------------
+    # Estilos
+    # -----------------------------------------------------------------------
 
-    @staticmethod
-    def texto(pai):
-        quadro = ttk.Frame(pai)
-        quadro.pack(fill="both", expand=True, pady=(10, 0))
-        texto = tk.Text(
-            quadro, wrap="none", font=("Consolas", 11), height=10,
-            background="#ffffff", foreground="#172b4d", relief="flat",
-            padx=12, pady=12, state="disabled",
-        )
-        vertical = ttk.Scrollbar(quadro, orient="vertical", command=texto.yview)
-        horizontal = ttk.Scrollbar(quadro, orient="horizontal", command=texto.xview)
-        texto.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
-        texto.grid(row=0, column=0, sticky="nsew")
-        vertical.grid(row=0, column=1, sticky="ns")
-        horizontal.grid(row=1, column=0, sticky="ew")
-        quadro.rowconfigure(0, weight=1)
-        quadro.columnconfigure(0, weight=1)
-        return texto
+    def _estilos(self, janela: tk.Tk) -> None:
+        s = ttk.Style(janela)
+        s.theme_use("clam")
+        s.configure("TLabel",          font=("Segoe UI", 10))
+        s.configure("TButton",         font=("Segoe UI", 10), padding=5)
+        s.configure("Treeview",        font=("Segoe UI", 10), rowheight=25)
+        s.configure("Treeview.Heading",font=("Segoe UI", 10, "bold"))
+        s.configure("Titulo.TLabel",   font=("Segoe UI", 17, "bold"))
+        s.configure("Dest.TLabel",     font=("Segoe UI", 11, "bold"), foreground="#0d6efd")
+
+    # -----------------------------------------------------------------------
+    # Componentes reutilizáveis
+    # -----------------------------------------------------------------------
+
+    def _combobox_cidade(self, pai, label: str, col: int) -> ttk.Combobox:
+        ttk.Label(pai, text=label).grid(row=0, column=col, sticky="w")
+        cb = ttk.Combobox(pai, state="readonly", width=22)
+        cb.grid(row=1, column=col, sticky="ew", padx=(0, 8), pady=(4, 8))
+        pai.columnconfigure(col, weight=1)
+        self._seletores.append(cb)
+        return cb
 
     @staticmethod
-    def escrever(campo, texto):
-        campo.configure(state="normal")
-        campo.delete("1.0", "end")
-        campo.insert("1.0", texto)
-        campo.configure(state="disabled")
+    def _treeview(pai, colunas: dict[str, str], altura: int = 7) -> ttk.Treeview:
+        f = ttk.Frame(pai)
+        f.pack(fill="both", expand=True)
+        tv = ttk.Treeview(f, columns=list(colunas), show="headings", height=altura)
+        for k, v in colunas.items():
+            tv.heading(k, text=v)
+            tv.column(k, width=110, minwidth=60)
+        sv = ttk.Scrollbar(f, orient="vertical",   command=tv.yview)
+        sh = ttk.Scrollbar(f, orient="horizontal",  command=tv.xview)
+        tv.configure(yscrollcommand=sv.set, xscrollcommand=sh.set)
+        tv.grid(row=0, column=0, sticky="nsew")
+        sv.grid(row=0, column=1, sticky="ns")
+        sh.grid(row=1, column=0, sticky="ew")
+        f.rowconfigure(0, weight=1)
+        f.columnconfigure(0, weight=1)
+        return tv
 
-    def criar_cadastro(self, pai):
-        cidades = ttk.LabelFrame(pai, text="Cidades", padding=12)
-        cidades.pack(side="left", fill="both", padx=(0, 16))
-        ttk.Label(cidades, text="Nome da cidade").pack(anchor="w")
-        self.nome_cidade = ttk.Entry(cidades, width=25)
-        self.nome_cidade.pack(fill="x", pady=(5, 8))
-        self.nome_cidade.bind("<Return>", lambda evento: self.adicionar_cidade())
-        ttk.Button(cidades, text="Adicionar cidade", command=self.adicionar_cidade).pack(
-            fill="x", pady=(0, 12)
+    @staticmethod
+    def _caixa_texto(pai) -> tk.Text:
+        f = ttk.Frame(pai)
+        f.pack(fill="both", expand=True, pady=(6, 0))
+        t = tk.Text(
+            f, wrap="none", font=("Consolas", 10), height=10,
+            bg="#ffffff", fg="#172b4d", relief="solid", bd=1,
+            padx=8, pady=8, state="disabled",
         )
-        self.tabela_cidades = self.tabela(cidades, {"nome": "Cidades cadastradas"})
+        sv = ttk.Scrollbar(f, orient="vertical",   command=t.yview)
+        sh = ttk.Scrollbar(f, orient="horizontal",  command=t.xview)
+        t.configure(yscrollcommand=sv.set, xscrollcommand=sh.set)
+        t.grid(row=0, column=0, sticky="nsew")
+        sv.grid(row=0, column=1, sticky="ns")
+        sh.grid(row=1, column=0, sticky="ew")
+        f.rowconfigure(0, weight=1)
+        f.columnconfigure(0, weight=1)
+        return t
 
-        estradas = ttk.LabelFrame(pai, text="Estradas", padding=12)
-        estradas.pack(side="left", fill="both", expand=True)
-        form = ttk.Frame(estradas)
-        form.pack(fill="x")
-        self.estrada_origem = self.seletor_cidade(form, "Origem", 0)
-        self.estrada_destino = self.seletor_cidade(form, "Destino", 1)
-        medidas = ttk.Frame(estradas)
-        medidas.pack(fill="x")
-        self.pesos = {}
-        for coluna, (chave, titulo) in enumerate(
-            (("distancia", "Distância (km)"), ("custo", "Custo (R$)"), ("tempo", "Tempo (min)"))
-        ):
-            ttk.Label(medidas, text=titulo).grid(row=0, column=coluna, sticky="w")
-            campo = ttk.Entry(medidas, width=14)
-            campo.grid(row=1, column=coluna, sticky="ew", padx=(0, 8), pady=(5, 8))
-            medidas.columnconfigure(coluna, weight=1)
-            self.pesos[chave] = campo
-        ttk.Label(estradas, text="Use vírgula ou ponto decimal, sem separador de milhares.").pack(
-            anchor="w"
-        )
-        self.mao_dupla = tk.BooleanVar(value=True)
-        ttk.Checkbutton(estradas, text="Estrada de mão dupla", variable=self.mao_dupla).pack(anchor="w")
-        ttk.Button(estradas, text="Salvar estrada", command=self.salvar_estrada).pack(
-            anchor="w", pady=(8, 10)
-        )
-        ttk.Label(estradas, text="Selecione uma estrada para editar seus valores.").pack(
-            anchor="w", pady=(0, 8)
-        )
-        self.tabela_estradas = self.tabela(
-            estradas,
-            {"origem": "Origem", "destino": "Destino", "distancia": "km", "custo": "R$", "tempo": "min", "sentido": "Sentido"},
-        )
-        self.tabela_estradas.bind("<<TreeviewSelect>>", self.selecionar_estrada)
+    @staticmethod
+    def _escrever(t: tk.Text, texto: str) -> None:
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        t.insert("1.0", texto)
+        t.configure(state="disabled")
 
-    def criar_rotas(self, pai):
+    # -----------------------------------------------------------------------
+    # ABA 1 — Calcular Rota
+    # -----------------------------------------------------------------------
+
+    def _aba_rota(self, pai: ttk.Frame) -> None:
+        # Linha de seletores
         form = ttk.Frame(pai)
         form.pack(fill="x")
-        self.rota_origem = self.seletor_cidade(form, "Cidade de origem", 0)
-        self.rota_destino = self.seletor_cidade(form, "Cidade de destino", 1)
+
+        self.cb_origem  = self._combobox_cidade(form, "Cidade de Origem",  0)
+        self.cb_destino = self._combobox_cidade(form, "Cidade de Destino", 1)
+
         ttk.Label(form, text="Otimizar por").grid(row=0, column=2, sticky="w")
-        self.criterio_rota = ttk.Combobox(form, values=list(CRITERIOS), state="readonly", width=25)
-        self.criterio_rota.current(0)
-        self.criterio_rota.grid(row=1, column=2, sticky="ew", pady=(5, 12))
+        self.cb_criterio = ttk.Combobox(form, values=list(CRITERIOS), state="readonly", width=22)
+        self.cb_criterio.current(0)
+        self.cb_criterio.grid(row=1, column=2, sticky="ew", pady=(4, 8))
         form.columnconfigure(2, weight=1)
-        for seletor in (self.rota_origem, self.rota_destino, self.criterio_rota):
-            seletor.bind("<<ComboboxSelected>>", lambda evento: self.limpar_rota())
-        ttk.Button(pai, text="Calcular melhor rota", command=self.calcular_rota).pack(anchor="w")
-        self.botao_rota_mapa = ttk.Button(
-            pai, text="Ver rota no mapa", command=lambda: self.abrir_mapa(self.ultima_rota), state="disabled"
-        )
-        self.botao_rota_mapa.pack(anchor="w", pady=(6, 0))
-        self.resumo_rota = tk.StringVar()
-        ttk.Label(pai, textvariable=self.resumo_rota, style="Resumo.TLabel").pack(
-            anchor="w", pady=(20, 8)
-        )
-        self.resultado_rota = self.texto(pai)
 
-    def criar_adjacencia(self, pai):
-        ttk.Label(pai, text="Peso exibido nas conexões").pack(anchor="w")
-        self.criterio_adjacencia = ttk.Combobox(
-            pai, values=list(CRITERIOS), state="readonly", width=28
+        for w in (self.cb_origem, self.cb_destino, self.cb_criterio):
+            w.bind("<<ComboboxSelected>>", lambda _: self._limpar_rota())
+
+        # Botões
+        bts = ttk.Frame(pai)
+        bts.pack(fill="x", pady=(0, 10))
+
+        ttk.Button(bts, text="🔍 Calcular Rota",
+                   command=self._calcular_rota).pack(side="left", padx=(0, 6))
+        ttk.Button(bts, text="⇄ Inverter",
+                   command=self._inverter_rota).pack(side="left", padx=(0, 6))
+        self.btn_ver_mapa = ttk.Button(
+            bts, text="🗺️ Ver no Mapa",
+            command=lambda: self._abrir_mapa(self.ultima_rota), state="disabled"
         )
-        self.criterio_adjacencia.current(0)
-        self.criterio_adjacencia.pack(anchor="w", pady=(5, 12))
-        self.criterio_adjacencia.bind("<<ComboboxSelected>>", lambda evento: self.atualizar_adjacencia())
-        ttk.Label(pai, text="∞ indica ausência de estrada direta; a diagonal da matriz vale zero.").pack(anchor="w")
-        abas = ttk.Notebook(pai)
-        abas.pack(fill="both", expand=True, pady=(12, 0))
-        lista = ttk.Frame(abas)
-        matriz = ttk.Frame(abas)
-        abas.add(lista, text=" Lista de adjacência ")
-        abas.add(matriz, text=" Matriz de adjacência ")
-        self.texto_lista = self.texto(lista)
-        self.texto_matriz = self.texto(matriz)
+        self.btn_ver_mapa.pack(side="left", padx=(0, 6))
+        ttk.Button(bts, text="🌐 Mapa Geral",
+                   command=lambda: self._abrir_mapa()).pack(side="left")
 
-    def criar_mapa(self, pai):
-        ttk.Label(pai, text="Pesquise cidades reais e importe o trajeto de carro sugerido pelo OSRM.", style="Resumo.TLabel").pack(anchor="w")
-        busca = ttk.Frame(pai)
-        busca.pack(fill="x", pady=(12, 8))
-        ttk.Label(busca, text="Cidade / estado / país:").pack(side="left", padx=(0, 8))
-        self.busca_cidade = ttk.Entry(busca)
-        self.busca_cidade.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        self.busca_cidade.bind("<Return>", lambda evento: self.buscar_cidade_mapa())
-        botao_busca = ttk.Button(busca, text="Buscar", command=self.buscar_cidade_mapa)
-        botao_busca.pack(side="left")
-        self.resultados_busca = []
-        self.lista_busca = self.tabela(pai, {"cidade": "Resultados — selecione uma cidade"}, altura=5)
-        selecao = ttk.Frame(pai)
-        selecao.pack(fill="x", pady=8)
-        self.botoes_mapa = [botao_busca]
-        for tipo in ("origem", "destino"):
-            botao = ttk.Button(selecao, text=f"Usar como {tipo}", command=lambda t=tipo: self.selecionar_cidade_mapa(t))
-            botao.pack(side="left", padx=(0, 8))
-            self.botoes_mapa.append(botao)
-        self.cidades_mapa = {"origem": None, "destino": None}
-        self.rotulos_mapa = {}
-        for tipo in self.cidades_mapa:
-            texto = tk.StringVar(value=f"{tipo.capitalize()}: selecione uma cidade")
-            self.rotulos_mapa[tipo] = texto
-            ttk.Label(pai, textvariable=texto, wraplength=880).pack(anchor="w", pady=3)
-        custo = ttk.Frame(pai)
-        custo.pack(fill="x", pady=(12, 4))
-        ttk.Label(custo, text="Custo estimado por km (R$):").pack(side="left", padx=(0, 8))
-        self.custo_km = ttk.Entry(custo, width=12)
-        self.custo_km.insert(0, "0,50")
-        self.custo_km.pack(side="left")
-        ttk.Label(pai, text="Ajuste o custo por km. A estimativa não inclui pedágios; o tempo não inclui trânsito ao vivo.").pack(anchor="w")
-        acoes = ttk.Frame(pai)
-        acoes.pack(fill="x", pady=10)
-        importar = ttk.Button(acoes, text="Consultar trajeto e cadastrar", command=self.importar_trajeto)
-        importar.pack(side="left", padx=(0, 8))
-        self.botoes_mapa.append(importar)
-        ttk.Button(acoes, text="Abrir mapa do cadastro", command=self.abrir_mapa).pack(side="left")
-        self.status_mapa = tk.StringVar(value="Busca: Photon • Estradas: OSRM • Mapa: Leaflet / OpenStreetMap • Requer internet")
-        ttk.Label(pai, textvariable=self.status_mapa, wraplength=880).pack(anchor="w", pady=4)
-        ttk.Label(
-            pai, wraplength=880,
-            text="Cada consulta importa o trajeto no sentido escolhido. Consulte o sentido inverso para cadastrar a volta. "
-                 "Dijkstra compara os caminhos da rede que você importou ou cadastrou.",
-        ).pack(anchor="w", pady=(5, 0))
+        # Resumo e resultado
+        self.var_resumo = tk.StringVar()
+        ttk.Label(pai, textvariable=self.var_resumo, style="Dest.TLabel").pack(
+            anchor="w", pady=(4, 2)
+        )
+        self.txt_rota = self._caixa_texto(pai)
 
-    def tarefa_mapa(self, tarefa, ao_concluir):
+    def _limpar_rota(self) -> None:
+        self.ultima_rota = None
+        self.btn_ver_mapa.configure(state="disabled")
+        if not self.grafo.cidades:
+            self.var_resumo.set("💡 Nenhuma cidade cadastrada. Use a aba 'Gerenciar' para começar.")
+        else:
+            self.var_resumo.set("Selecione origem e destino, depois clique em 'Calcular Rota'.")
+        self._escrever(self.txt_rota, "")
+
+    def _inverter_rota(self) -> None:
+        a, b = self.cb_origem.get(), self.cb_destino.get()
+        self.cb_origem.set(b)
+        self.cb_destino.set(a)
+        self._limpar_rota()
+
+    def _calcular_rota(self) -> None:
+        self._limpar_rota()
+        if len(self.grafo.cidades) < 2:
+            messagebox.showwarning(
+                "Sem cidades",
+                "Cadastre ao menos 2 cidades e uma estrada antes de calcular rotas.",
+                parent=self.janela,
+            )
+            return
+
+        origem, destino = self.cb_origem.get(), self.cb_destino.get()
+        if not origem or not destino:
+            messagebox.showwarning("Atenção", "Selecione a origem e o destino.", parent=self.janela)
+            return
+        if origem == destino:
+            messagebox.showwarning("Atenção", "Origem e destino devem ser cidades diferentes.", parent=self.janela)
+            return
+
+        criterio = CRITERIOS[self.cb_criterio.get()]
+        try:
+            rota = self.grafo.menor_rota(origem, destino, criterio)
+        except ValueError as e:
+            messagebox.showerror("Erro", str(e), parent=self.janela)
+            return
+
+        if rota is None:
+            self.var_resumo.set("Sem caminho entre essas cidades.")
+            self._escrever(self.txt_rota, "Não há estradas conectando essas cidades no grafo atual.")
+            return
+
+        self.ultima_rota = rota
+        self.btn_ver_mapa.configure(state="normal")
+        self.var_resumo.set(
+            f"Distância: {fmt(rota.distancia)} km   |   "
+            f"Tempo: {fmt(rota.tempo)} min"
+        )
+        self._escrever(
+            self.txt_rota,
+            f"Critério: {self.cb_criterio.get()}   |   Algoritmo: Dijkstra\n\n"
+            f"Percurso:  {' → '.join(rota.cidades)}\n\n"
+            f"Passo a passo:\n"
+            + "\n".join(f"  {i}. {c}" for i, c in enumerate(rota.cidades, 1)),
+        )
+
+    # -----------------------------------------------------------------------
+    # ABA 2 — Gerenciar Cidades e Estradas
+    # (inclui busca de cidades reais e importação de trajetos)
+    # -----------------------------------------------------------------------
+
+    def _aba_gerenciar(self, pai: ttk.Frame) -> None:
+        """
+        Aba unificada dividida em três seções na vertical:
+          A) Cidades (lista + adicionar/remover + busca real)
+          B) Estradas (formulário + lista)
+        """
+        # Painel dividido em esquerda (cidades) e direita (estradas)
+        painel = ttk.Frame(pai)
+        painel.pack(fill="both", expand=True)
+
+        # ── ESQUERDA: Cidades ────────────────────────────────────────────────
+        esq = ttk.LabelFrame(painel, text=" Cidades ", padding=10)
+        esq.pack(side="left", fill="both", padx=(0, 10))
+
+        # Entrada manual
+        ttk.Label(esq, text="Nome da cidade:").pack(anchor="w")
+        self.ent_cidade = ttk.Entry(esq, width=24)
+        self.ent_cidade.pack(fill="x", pady=(3, 5))
+        self.ent_cidade.bind("<Return>", lambda _: self._add_cidade())
+
+        bts_cid = ttk.Frame(esq)
+        bts_cid.pack(fill="x", pady=(0, 8))
+        ttk.Button(bts_cid, text="➕ Adicionar", command=self._add_cidade).pack(
+            side="left", fill="x", expand=True, padx=(0, 3))
+        ttk.Button(bts_cid, text="🗑️ Excluir", command=self._rem_cidade).pack(
+            side="left", fill="x", expand=True)
+
+        self.tv_cidades = self._treeview(esq, {"nome": "Cidades cadastradas"}, altura=6)
+
+        ttk.Separator(esq, orient="horizontal").pack(fill="x", pady=8)
+
+        # Busca de cidades reais (OpenStreetMap)
+        ttk.Label(esq, text="🔎 Buscar cidade real (OpenStreetMap):").pack(anchor="w")
+        busca_f = ttk.Frame(esq)
+        busca_f.pack(fill="x", pady=(3, 4))
+        self.ent_busca = ttk.Entry(busca_f)
+        self.ent_busca.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        self.ent_busca.bind("<Return>", lambda _: self._buscar_cidade())
+        self.btn_busca = ttk.Button(busca_f, text="Buscar", command=self._buscar_cidade)
+        self.btn_busca.pack(side="left")
+
+        self.tv_busca = self._treeview(esq, {"cidade": "Resultados da busca"}, altura=5)
+        self.tv_busca.bind("<Double-1>", lambda _: self._add_cidade_real())
+
+        bts_real = ttk.Frame(esq)
+        bts_real.pack(fill="x", pady=(4, 0))
+        self.btn_add_real = ttk.Button(bts_real, text="➕ Adicionar ao Grafo", command=self._add_cidade_real)
+        self.btn_add_real.pack(side="left", padx=(0, 4))
+
+        self.var_status_busca = tk.StringVar(value="Digite uma cidade e clique em Buscar.")
+        ttk.Label(esq, textvariable=self.var_status_busca, foreground="#0a6efd",
+                  wraplength=240, font=("Segoe UI", 9)).pack(anchor="w", pady=(5, 0))
+        # Todos os botões que ficam desabilitados durante consulta de rede
+        self._botoes_rede = [self.btn_busca, self.btn_add_real]
+
+        # Botão de zerar cadastro
+        ttk.Separator(esq, orient="horizontal").pack(fill="x", pady=8)
+        ttk.Button(esq, text="⚠️ Zerar Todo o Cadastro",
+                   command=self._zerar).pack(fill="x")
+
+        # ── DIREITA: Estradas ────────────────────────────────────────────────
+        dir = ttk.LabelFrame(painel, text=" Estradas ", padding=10)
+        dir.pack(side="left", fill="both", expand=True)
+
+        form_e = ttk.Frame(dir)
+        form_e.pack(fill="x")
+        self.cb_est_orig = self._combobox_cidade(form_e, "Origem", 0)
+        self.cb_est_dest = self._combobox_cidade(form_e, "Destino", 1)
+
+        # Preenche km automaticamente ao selecionar origem/destino
+        for cb in (self.cb_est_orig, self.cb_est_dest):
+            cb.bind("<<ComboboxSelected>>", lambda _: self._auto_preencher_estrada())
+
+        pesos_f = ttk.Frame(dir)
+        pesos_f.pack(fill="x", pady=(0, 5))
+        self._campos_peso: dict[str, ttk.Entry] = {}
+        for col, (chave, label) in enumerate(
+            [("distancia", "Distância (km)"),
+             ("tempo",     "Tempo (min)")]
+        ):
+            ttk.Label(pesos_f, text=label).grid(row=0, column=col, sticky="w")
+            e = ttk.Entry(pesos_f, width=18)
+            e.grid(row=1, column=col, sticky="ew", padx=(0, 7), pady=(3, 5))
+            pesos_f.columnconfigure(col, weight=1)
+            self._campos_peso[chave] = e
+
+        self.lbl_dica_dist = ttk.Label(
+            dir,
+            text="Selecione origem e destino para consultar a distância real pelas rodovias.",
+            foreground="#0a6efd", font=("Segoe UI", 9), wraplength=400,
+        )
+        self.lbl_dica_dist.pack(anchor="w", pady=(0, 4))
+
+        self.var_maodupla = tk.BooleanVar(value=True)
+        ttk.Checkbutton(dir, text="Estrada de mão dupla (ida e volta)",
+                        variable=self.var_maodupla).pack(anchor="w", pady=(0, 6))
+
+        bts_est = ttk.Frame(dir)
+        bts_est.pack(fill="x", pady=(0, 8))
+        ttk.Button(bts_est, text="💾 Salvar Estrada", command=self._salvar_estrada).pack(side="left", padx=(0, 5))
+        ttk.Button(bts_est, text="🔄 Medir Rodovia",  command=self._auto_preencher_estrada).pack(side="left", padx=(0, 5))
+        ttk.Button(bts_est, text="🗑️ Excluir Estrada", command=self._rem_estrada).pack(side="left", padx=(0, 5))
+        ttk.Button(bts_est, text="Limpar Campos",     command=self._limpar_campos_estrada).pack(side="left")
+
+        ttk.Label(dir, text="Clique numa estrada para editar:",
+                  foreground="#555", font=("Segoe UI", 9)).pack(anchor="w", pady=(0, 3))
+
+        self.tv_estradas = self._treeview(
+            dir,
+            {"orig": "Origem", "dest": "Destino",
+             "dist": "km", "tempo": "min", "sentido": "Sentido"},
+            altura=12,
+        )
+        self.tv_estradas.bind("<<TreeviewSelect>>", self._sel_estrada)
+
+    # ─── Cidades (manual) ────────────────────────────────────────────────────
+
+    def _add_cidade(self) -> None:
+        nome = self.ent_cidade.get().strip()
+        if not nome:
+            messagebox.showwarning("Atenção", "Digite o nome da cidade.", parent=self.janela)
+            return
+        if self._salvar(lambda g: g.adicionar_cidade(nome)):
+            self.ent_cidade.delete(0, "end")
+            self.ent_cidade.focus_set()
+
+    def _rem_cidade(self) -> None:
+        sel = self.tv_cidades.selection()
+        if not sel:
+            messagebox.showinfo("Excluir", "Selecione uma cidade na lista.", parent=self.janela)
+            return
+        cidade = self.tv_cidades.item(sel[0])["values"][0]
+        if messagebox.askyesno(
+            "Confirmar",
+            f"Apagar a cidade '{cidade}'? Todas as estradas conectadas serão removidas.",
+            parent=self.janela,
+        ):
+            self._salvar(lambda g: g.remover_cidade(cidade))
+
+    def _zerar(self) -> None:
+        if not self.grafo.cidades:
+            messagebox.showinfo("Aviso", "O cadastro já está vazio.", parent=self.janela)
+            return
+        if messagebox.askyesno(
+            "Zerar Cadastro",
+            "Apagar TODAS as cidades e estradas? Esta ação não pode ser desfeita.",
+            parent=self.janela,
+        ):
+            self._salvar(lambda g: g.limpar())
+            self._limpar_campos_estrada()
+
+    # ─── Busca de cidades reais ───────────────────────────────────────────────
+
+    def _tarefa_rede(self, tarefa, ao_concluir) -> None:
+        """Executa tarefa de rede em segundo plano sem travar a UI."""
         if self.ocupado_mapa:
             return
         self.ocupado_mapa = True
-        for botao in self.botoes_mapa:
-            botao.configure(state="disabled")
+        for b in self._botoes_rede:
+            b.configure(state="disabled")
 
-        def executar():
+        def run():
             try:
                 self.fila_mapa.put((tarefa(), None))
-            except Exception as erro:
-                self.fila_mapa.put((None, erro))
+            except Exception as e:
+                self.fila_mapa.put((None, e))
 
-        def verificar():
+        def poll():
             try:
                 resultado, erro = self.fila_mapa.get_nowait()
             except Empty:
-                self.janela.after(100, verificar)
+                self.janela.after(100, poll)
                 return
             self.ocupado_mapa = False
-            for botao in self.botoes_mapa:
-                botao.configure(state="normal")
-            if erro is not None:
-                self.status_mapa.set(f"Não foi possível concluir: {erro}")
+            for b in self._botoes_rede:
+                b.configure(state="normal")
+            if erro:
+                self.var_status_busca.set(f"Erro: {erro}")
             else:
                 ao_concluir(resultado)
 
-        Thread(target=executar, daemon=True).start()
-        self.janela.after(100, verificar)
+        Thread(target=run, daemon=True).start()
+        self.janela.after(100, poll)
 
-    def buscar_cidade_mapa(self):
-        if self.ocupado_mapa:
-            return
-        consulta = self.busca_cidade.get().strip()
+    def _buscar_cidade(self) -> None:
+        consulta = self.ent_busca.get().strip()
         if len(consulta) < 2:
-            self.status_mapa.set("Digite o nome da cidade; acrescente estado e país para refinar a busca.")
+            self.var_status_busca.set("Digite ao menos 2 caracteres para buscar.")
             return
-        self.lista_busca.delete(*self.lista_busca.get_children())
+        self.tv_busca.delete(*self.tv_busca.get_children())
         self.resultados_busca = []
-        self.status_mapa.set("Pesquisando cidades…")
+        self.var_status_busca.set("Buscando…")
 
-        def mostrar(cidades):
+        def mostrar(cidades: list[dict]):
             self.resultados_busca = cidades
-            for indice, cidade in enumerate(cidades):
-                self.lista_busca.insert("", "end", iid=str(indice), values=(cidade["nome"],))
-            self.status_mapa.set(f"{len(cidades)} cidade(s) encontrada(s). Selecione a origem ou o destino.")
+            for i, c in enumerate(cidades):
+                self.tv_busca.insert("", "end", iid=str(i), values=(c["nome"],))
+            self.var_status_busca.set(
+                f"{len(cidades)} cidade(s). Duplo-clique ou use '➕ Adicionar ao Grafo'."
+            )
 
-        self.tarefa_mapa(lambda: self.servico_mapas.buscar_cidades(consulta), mostrar)
+        self._tarefa_rede(lambda: self.servico_mapas.buscar_cidades(consulta), mostrar)
 
-    def selecionar_cidade_mapa(self, tipo):
-        selecao = self.lista_busca.selection()
-        if not selecao:
-            self.status_mapa.set("Selecione uma cidade nos resultados da busca.")
+    def _add_cidade_real(self) -> None:
+        sel = self.tv_busca.selection()
+        if not sel:
+            self.var_status_busca.set("Selecione uma cidade nos resultados.")
             return
-        cidade = self.resultados_busca[int(selecao[0])]
-        self.cidades_mapa[tipo] = cidade
-        self.rotulos_mapa[tipo].set(f"{tipo.capitalize()}: {cidade['nome']}")
+        c = self.resultados_busca[int(sel[0])]
+        if self._salvar(lambda g: g.adicionar_ou_atualizar_cidade(c["nome"], c["latitude"], c["longitude"])):
+            self.var_status_busca.set(f"'{c['nome']}' adicionada ao grafo!")
 
-    def importar_trajeto(self):
-        if self.ocupado_mapa:
+    # ─── Estradas ────────────────────────────────────────────────────────────
+
+    def _auto_preencher_estrada(self) -> None:
+        """Consulta e preenche a distância real por rodovias (OSRM) ao escolher origem e destino."""
+        orig, dest = self.cb_est_orig.get(), self.cb_est_dest.get()
+        if not orig or not dest or orig == dest:
             return
-        origem, destino = self.cidades_mapa.values()
-        if origem is None or destino is None or origem == destino:
-            self.status_mapa.set("Selecione duas cidades diferentes para consultar o trajeto.")
+
+        coords = self.grafo.coordenadas
+        if orig not in coords or dest not in coords:
+            self._geometria_pendente = None
+            self.lbl_dica_dist.configure(
+                text="⚠️ Uma ou ambas as cidades não têm coordenadas cadastradas. Digite a distância manualmente.",
+                foreground="#cc6600",
+            )
+            return
+
+        lat1, lon1 = coords[orig]
+        lat2, lon2 = coords[dest]
+
+        self._consulta_estrada_seq += 1
+        seq_atual = self._consulta_estrada_seq
+        self._geometria_pendente = None
+
+        self.lbl_dica_dist.configure(
+            text="⏳ Medindo distância real pelas estradas (via OSRM)...",
+            foreground="#0a6efd",
+        )
+
+        def buscar():
+            try:
+                dados = self.servico_mapas.consultar_estrada(
+                    {"latitude": lat1, "longitude": lon1},
+                    {"latitude": lat2, "longitude": lon2},
+                )
+                erro = None
+            except Exception as e:
+                dados = None
+                erro = e
+
+            def atualizar_ui():
+                if seq_atual != self._consulta_estrada_seq:
+                    return
+                if self.cb_est_orig.get() != orig or self.cb_est_dest.get() != dest:
+                    return
+
+                if dados:
+                    dist_km = round(dados["distancia"], 2)
+                    tempo_min = round(dados["tempo"], 1)
+                    self._geometria_pendente = dados.get("geometria")
+
+                    for campo in self._campos_peso.values():
+                        campo.delete(0, "end")
+                    self._campos_peso["distancia"].insert(0, fmt(dist_km))
+                    self._campos_peso["tempo"].insert(0, fmt(tempo_min))
+
+                    self.lbl_dica_dist.configure(
+                        text=f"🛣️ Estrada real: {fmt(dist_km)} km • Tempo estimado: {fmt(tempo_min)} min (via rodovias).",
+                        foreground="#1a7a1a",
+                    )
+                else:
+                    dist_reta = round(haversine(lat1, lon1, lat2, lon2), 2)
+                    tempo_reta = round(dist_reta / 80 * 60, 1)
+
+                    for campo in self._campos_peso.values():
+                        campo.delete(0, "end")
+                    self._campos_peso["distancia"].insert(0, fmt(dist_reta))
+                    self._campos_peso["tempo"].insert(0, fmt(tempo_reta))
+
+                    msg_err = str(erro) if erro else "serviço indisponível"
+                    self.lbl_dica_dist.configure(
+                        text=f"⚠️ Não foi possível obter trajeto rodoviário ({msg_err}). Usando linha reta: {fmt(dist_reta)} km.",
+                        foreground="#cc6600",
+                    )
+
+            self.janela.after(0, atualizar_ui)
+
+        Thread(target=buscar, daemon=True).start()
+
+    def _salvar_estrada(self) -> None:
+        orig, dest = self.cb_est_orig.get(), self.cb_est_dest.get()
+        if not orig or not dest:
+            messagebox.showwarning("Atenção", "Selecione origem e destino.", parent=self.janela)
+            return
+        if orig == dest:
+            messagebox.showwarning("Atenção", "Origem e destino devem ser diferentes.", parent=self.janela)
+            return
+
+        txt_d = self._campos_peso["distancia"].get().strip()
+        if not txt_d:
+            # Tenta calcular automaticamente antes de reclamar
+            self._auto_preencher_estrada()
+            txt_d = self._campos_peso["distancia"].get().strip()
+        if not txt_d:
+            messagebox.showwarning(
+                "Distância não preenchida",
+                "Não foi possível calcular a distância automaticamente (cidades sem coordenadas).\n"
+                "Digite a distância em km no campo correspondente.",
+                parent=self.janela,
+            )
+            self._campos_peso["distancia"].focus_set()
             return
         try:
-            custo_km = float(self.custo_km.get().strip().replace(",", "."))
-            if not math.isfinite(custo_km) or custo_km < 0:
-                raise ValueError
-        except ValueError:
-            self.status_mapa.set("Informe um custo por km válido, maior ou igual a zero.")
+            dist = parse_float(txt_d, "distância")
+            if dist <= 0:
+                raise ValueError("A distância deve ser maior que zero.")
+        except ValueError as e:
+            messagebox.showerror("Valor inválido", str(e), parent=self.janela)
             return
-        self.status_mapa.set("Consultando o trajeto rodoviário…")
 
-        def importar(estrada):
-            def alterar(grafo):
-                for cidade in (origem, destino):
-                    if cidade["nome"].casefold() not in {nome.casefold() for nome in grafo.cidades}:
-                        grafo.adicionar_cidade(cidade["nome"], cidade["latitude"], cidade["longitude"])
-                    else:
-                        grafo.definir_coordenadas(cidade["nome"], cidade["latitude"], cidade["longitude"])
-                grafo.adicionar_estrada(
-                    origem["nome"], destino["nome"], estrada["distancia"],
-                    estrada["distancia"] * custo_km, estrada["tempo"],
-                    bidirecional=False, geometria=estrada["geometria"],
-                )
-            if self.salvar_alteracao(alterar):
-                self.status_mapa.set(
-                    f"Trajeto cadastrado: {numero(estrada['distancia'])} km • {numero(estrada['tempo'])} min estimados. "
-                    "Use ‘Abrir mapa do cadastro’ para visualizar."
-                )
-            else:
-                self.status_mapa.set("O trajeto foi consultado, mas não foi salvo. Verifique o erro informado.")
+        # Tempo: opcional (estimativa 1 min/km)
+        txt_t = self._campos_peso["tempo"].get().strip()
+        if txt_t:
+            try:
+                tempo = parse_float(txt_t, "tempo")
+                if tempo <= 0:
+                    raise ValueError("O tempo deve ser maior que zero.")
+            except ValueError as e:
+                messagebox.showerror("Valor inválido", str(e), parent=self.janela)
+                return
+        else:
+            tempo = round(dist, 1)
+            self._campos_peso["tempo"].delete(0, "end")
+            self._campos_peso["tempo"].insert(0, fmt(tempo))
 
-        self.tarefa_mapa(lambda: self.servico_mapas.consultar_estrada(origem, destino), importar)
+        geo = self._geometria_pendente or self.grafo.obter_geometria(orig, dest)
+        if self._salvar(
+            lambda g: g.adicionar_estrada(
+                orig, dest, distancia=dist, custo=0.0, tempo=tempo,
+                bidirecional=self.var_maodupla.get(), geometria=geo,
+            )
+        ):
+            self._geometria_pendente = None
+            self._limpar_campos_estrada()
 
-    def abrir_mapa(self, rota=None):
-        if rota and any(cidade not in self.grafo.coordenadas for cidade in rota.cidades):
-            messagebox.showinfo("Mapa", "Há cidades sem coordenadas nesta rota. Importe suas localizações na aba do mapa.", parent=self.janela)
+    def _rem_estrada(self) -> None:
+        sel = self.tv_estradas.selection()
+        if not sel:
+            messagebox.showinfo("Excluir", "Selecione uma estrada na lista.", parent=self.janela)
+            return
+        e = self.grafo.estradas[int(sel[0])]
+        if messagebox.askyesno("Confirmar", f"Apagar estrada '{e.origem}' → '{e.destino}'?", parent=self.janela):
+            self._salvar(lambda g: g.remover_estrada(e.origem, e.destino))
+            self._limpar_campos_estrada()
+
+    def _limpar_campos_estrada(self) -> None:
+        self._geometria_pendente = None
+        self.tv_estradas.selection_remove(*self.tv_estradas.selection())
+        for campo in self._campos_peso.values():
+            campo.delete(0, "end")
+        self.var_maodupla.set(True)
+
+    def _sel_estrada(self, _=None) -> None:
+        sel = self.tv_estradas.selection()
+        if not sel:
+            return
+        e = self.grafo.estradas[int(sel[0])]
+        self.cb_est_orig.set(e.origem)
+        self.cb_est_dest.set(e.destino)
+        self.var_maodupla.set(e.bidirecional)
+        for k, campo in self._campos_peso.items():
+            campo.delete(0, "end")
+            campo.insert(0, str(getattr(e, k)).replace(".", ","))
+
+    # -----------------------------------------------------------------------
+    # ABA 3 — Adjacência
+    # -----------------------------------------------------------------------
+
+    def _aba_adjacencia(self, pai: ttk.Frame) -> None:
+        crit_f = ttk.Frame(pai)
+        crit_f.pack(fill="x", pady=(0, 6))
+        ttk.Label(crit_f, text="Peso exibido:").pack(side="left", padx=(0, 6))
+        self.cb_adj_criterio = ttk.Combobox(crit_f, values=list(CRITERIOS), state="readonly", width=24)
+        self.cb_adj_criterio.current(0)
+        self.cb_adj_criterio.pack(side="left")
+        self.cb_adj_criterio.bind("<<ComboboxSelected>>", lambda _: self._atualizar_adjacencia())
+
+        ttk.Label(
+            pai,
+            text="∞ = sem aresta direta • diagonal = 0 • a lista mostra as conexões de saída de cada vértice.",
+            foreground="#555", font=("Segoe UI", 9),
+        ).pack(anchor="w", pady=(0, 8))
+
+        sub = ttk.Notebook(pai)
+        sub.pack(fill="both", expand=True)
+
+        lista_f  = ttk.Frame(sub, padding=6)
+        matriz_f = ttk.Frame(sub, padding=6)
+        sub.add(lista_f,  text=" Lista de Adjacência ")
+        sub.add(matriz_f, text=" Matriz de Adjacência ")
+
+        self.txt_lista  = self._caixa_texto(lista_f)
+        self.txt_matriz = self._caixa_texto(matriz_f)
+
+    # -----------------------------------------------------------------------
+    # Mapa
+    # -----------------------------------------------------------------------
+
+    def _abrir_mapa(self, rota=None) -> None:
+        if rota and any(c not in self.grafo.coordenadas for c in rota.cidades):
+            messagebox.showinfo(
+                "Mapa",
+                "Algumas cidades da rota não têm coordenadas. "
+                "Importe-as via busca real para visualizá-las no mapa.",
+                parent=self.janela,
+            )
             return
         try:
-            arquivo = gerar_mapa(self.grafo, self.arquivo.with_name("rotas_mapa.html"), rota)
+            html = gerar_mapa(self.grafo, self.arquivo.with_name("rotas_mapa.html"), rota)
             if self.servidor_mapa is None:
-                self.servidor_mapa = ServidorMapa(arquivo)
+                self.servidor_mapa = ServidorMapa(html)
             if not webbrowser.open(self.servidor_mapa.url):
                 messagebox.showinfo("Mapa", f"Abra no navegador: {self.servidor_mapa.url}", parent=self.janela)
-        except (OSError, ValueError, ErroMapa) as erro:
-            messagebox.showerror("Não foi possível abrir o mapa", str(erro), parent=self.janela)
+        except (OSError, ValueError, ErroMapa) as e:
+            messagebox.showerror("Erro ao abrir mapa", str(e), parent=self.janela)
 
-    def fechar(self):
-        if self.servidor_mapa is not None:
+    # -----------------------------------------------------------------------
+    # Persistência e atualização da UI
+    # -----------------------------------------------------------------------
+
+    def _salvar(self, alterar) -> bool:
+        """Aplica `alterar(grafo_cópia)` e grava o JSON atomicamente."""
+        try:
+            copia = Grafo.de_dict(self.grafo.para_dict())
+            alterar(copia)
+            conteudo = json.dumps(copia.para_dict(), ensure_ascii=False, indent=2, allow_nan=False)
+            tmp = self.arquivo.with_suffix(".tmp")
+            tmp.write_text(conteudo, encoding="utf-8")
+            tmp.replace(self.arquivo)
+        except (ValueError, OSError) as e:
+            messagebox.showerror("Erro ao salvar", str(e), parent=self.janela)
+            return False
+        self.grafo = copia
+        self._atualizar()
+        return True
+
+    def _atualizar(self) -> None:
+        """Sincroniza toda a interface com o estado atual do grafo."""
+        cidades = self.grafo.cidades
+
+        # Comboboxes de seleção de cidade
+        for cb in self._seletores:
+            atual = cb.get()
+            cb.configure(values=cidades)
+            if atual not in cidades:
+                cb.set(cidades[0] if cidades else "")
+
+        # Tabela de cidades
+        self.tv_cidades.delete(*self.tv_cidades.get_children())
+        for c in cidades:
+            self.tv_cidades.insert("", "end", values=(c,))
+
+        # Tabela de estradas
+        self.tv_estradas.delete(*self.tv_estradas.get_children())
+        for idx, e in enumerate(self.grafo.estradas):
+            sentido = "↔ Ida e volta" if e.bidirecional else "→ Só ida"
+            self.tv_estradas.insert("", "end", iid=str(idx), values=(
+                e.origem, e.destino,
+                fmt(e.distancia), fmt(e.tempo),
+                sentido,
+            ))
+
+        # Status bar
+        if cidades:
+            self.status.set(
+                f"{len(cidades)} cidade(s) • {len(self.grafo.estradas)} estrada(s) • {self.arquivo.name}"
+            )
+        else:
+            self.status.set(
+                "Grafo vazio — cadastre cidades na aba 'Gerenciar Cidades e Estradas'."
+            )
+
+        self._limpar_rota()
+        self._atualizar_adjacencia()
+
+    def _atualizar_adjacencia(self) -> None:
+        criterio = CRITERIOS[self.cb_adj_criterio.get()]
+        unidade  = UNIDADES[criterio]
+
+        # Lista
+        lista = self.grafo.lista_adjacencia(criterio)
+        linhas = [
+            f"• {cidade}:\n   ↳ " + (
+                ", ".join(f"{v} ({fmt(p)} {unidade})" for v, p in vizinhos)
+                or "sem conexões"
+            )
+            for cidade, vizinhos in lista.items()
+        ]
+        self._escrever(
+            self.txt_lista,
+            f"Lista de Adjacência  [{self.cb_adj_criterio.get()}]\n\n"
+            + ("\n\n".join(linhas) if linhas else "Nenhuma cidade cadastrada."),
+        )
+
+        # Matriz
+        cidades, matriz = self.grafo.matriz_adjacencia(criterio)
+        if not cidades:
+            self._escrever(self.txt_matriz, "Nenhuma cidade cadastrada.")
+            return
+
+        vals = [["∞" if math.isinf(p) else fmt(p) for p in row] for row in matriz]
+        col_w = max(8, *(len(c) for c in cidades), *(len(v) for row in vals for v in row)) + 2
+        cab = " " * col_w + "".join(c.rjust(col_w) for c in cidades)
+        sep = "-" * len(cab)
+        rows = [c.ljust(col_w) + "".join(v.rjust(col_w) for v in row) for c, row in zip(cidades, vals)]
+        self._escrever(
+            self.txt_matriz,
+            f"Matriz de Adjacência  [{unidade}]\n\n{cab}\n{sep}\n" + "\n".join(rows),
+        )
+
+    def _fechar(self) -> None:
+        if self.servidor_mapa:
             self.servidor_mapa.fechar()
         self.janela.destroy()
 
-    def salvar_alteracao(self, alterar):
-        try:
-            atualizado = Grafo.de_dict(self.grafo.para_dict())
-            alterar(atualizado)
-            conteudo = json.dumps(atualizado.para_dict(), ensure_ascii=False, indent=2, allow_nan=False)
-            temporario = self.arquivo.with_suffix(".tmp")
-            temporario.write_text(conteudo, encoding="utf-8")
-            temporario.replace(self.arquivo)
-        except (ValueError, OSError) as erro:
-            messagebox.showerror("Não foi possível salvar", str(erro), parent=self.janela)
-            return False
-        self.grafo = atualizado
-        self.atualizar()
-        return True
 
-    def adicionar_cidade(self):
-        if self.salvar_alteracao(lambda grafo: grafo.adicionar_cidade(self.nome_cidade.get())):
-            self.nome_cidade.delete(0, "end")
-            self.nome_cidade.focus_set()
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
-    def salvar_estrada(self):
-        valores = {}
-        for chave, campo in self.pesos.items():
-            try:
-                valores[chave] = float(campo.get().strip().replace(",", "."))
-            except ValueError:
-                messagebox.showerror(
-                    "Valor inválido", f"Informe um número válido no campo {chave}.", parent=self.janela
-                )
-                campo.focus_set()
-                return
-        origem, destino = self.estrada_origem.get(), self.estrada_destino.get()
-        geometria = ()
-        for estrada in self.grafo.estradas:
-            if (estrada.origem, estrada.destino) == (origem, destino):
-                geometria = estrada.geometria
-                break
-            if estrada.bidirecional and (estrada.destino, estrada.origem) == (origem, destino):
-                geometria = estrada.geometria[::-1]
-                break
-        self.salvar_alteracao(lambda grafo: grafo.adicionar_estrada(
-            origem, destino, **valores, bidirecional=self.mao_dupla.get(), geometria=geometria,
-        ))
-
-    def selecionar_estrada(self, evento=None):
-        selecao = self.tabela_estradas.selection()
-        if not selecao:
-            return
-        estrada = self.grafo.estradas[int(selecao[0])]
-        self.estrada_origem.set(estrada.origem)
-        self.estrada_destino.set(estrada.destino)
-        self.mao_dupla.set(estrada.bidirecional)
-        for chave, campo in self.pesos.items():
-            campo.delete(0, "end")
-            campo.insert(0, str(getattr(estrada, chave)).replace(".", ","))
-
-    def limpar_rota(self):
-        self.ultima_rota = None
-        self.botao_rota_mapa.configure(state="disabled")
-        self.resumo_rota.set("Selecione duas cidades e calcule uma rota.")
-        self.escrever(self.resultado_rota, "")
-
-    def calcular_rota(self):
-        self.limpar_rota()
-        criterio = CRITERIOS[self.criterio_rota.get()]
-        try:
-            rota = self.grafo.menor_rota(self.rota_origem.get(), self.rota_destino.get(), criterio)
-        except ValueError as erro:
-            messagebox.showerror("Não foi possível calcular", str(erro), parent=self.janela)
-            return
-        if rota is None:
-            self.resumo_rota.set("Não existe caminho entre essas cidades.")
-            self.escrever(self.resultado_rota, "Cadastre estradas que conectem as cidades escolhidas.")
-            return
-        self.ultima_rota = rota
-        self.botao_rota_mapa.configure(state="normal")
-        self.resumo_rota.set(
-            f"Distância: {numero(rota.distancia)} km   |   Custo: R$ {numero(rota.custo)}   |   Tempo: {numero(rota.tempo)} min"
-        )
-        self.escrever(
-            self.resultado_rota,
-            f"{self.criterio_rota.get()} — algoritmo de Dijkstra\n\n"
-            + " → ".join(rota.cidades)
-            + "\n\nPercurso:\n"
-            + "\n".join(f"{indice}. {cidade}" for indice, cidade in enumerate(rota.cidades, 1)),
-        )
-
-    def atualizar(self):
-        cidades = self.grafo.cidades
-        for seletor in self.seletores_cidades:
-            seletor.configure(values=cidades)
-            if seletor.get() not in cidades:
-                seletor.set(cidades[0] if cidades else "")
-        self.tabela_cidades.delete(*self.tabela_cidades.get_children())
-        for cidade in cidades:
-            self.tabela_cidades.insert("", "end", values=(cidade,))
-        self.tabela_estradas.delete(*self.tabela_estradas.get_children())
-        for indice, estrada in enumerate(self.grafo.estradas):
-            self.tabela_estradas.insert("", "end", iid=str(indice), values=(
-                estrada.origem, estrada.destino, numero(estrada.distancia), numero(estrada.custo), numero(estrada.tempo),
-                "Ida e volta" if estrada.bidirecional else "Origem → destino",
-            ))
-        self.status.set(f"{len(cidades)} cidade(s) • {len(self.grafo.estradas)} estrada(s) • Dados salvos em {self.arquivo.name}")
-        self.limpar_rota()
-        self.atualizar_adjacencia()
-
-    def atualizar_adjacencia(self):
-        criterio = CRITERIOS[self.criterio_adjacencia.get()]
-        unidade = UNIDADES[criterio]
-        lista = self.grafo.lista_adjacencia(criterio)
-        linhas = [
-            f"{cidade} → " + (", ".join(f"{vizinho} ({numero(peso)} {unidade})" for vizinho, peso in vizinhos) or "sem conexões")
-            for cidade, vizinhos in lista.items()
-        ]
-        self.escrever(self.texto_lista, "\n\n".join(linhas) or "Cadastre cidades para visualizar o grafo.")
-        cidades, matriz = self.grafo.matriz_adjacencia(criterio)
-        if not cidades:
-            self.escrever(self.texto_matriz, "Cadastre cidades para visualizar o grafo.")
-            return
-        tabela = [["∞" if math.isinf(peso) else numero(peso) for peso in linha] for linha in matriz]
-        largura = max(8, *(len(cidade) for cidade in cidades), *(len(valor) for linha in tabela for valor in linha)) + 2
-        linhas = [f"Pesos em {unidade}\n", "".ljust(largura) + "".join(cidade.rjust(largura) for cidade in cidades)]
-        linhas.extend(cidade.ljust(largura) + "".join(valor.rjust(largura) for valor in linha) for cidade, linha in zip(cidades, tabela))
-        self.escrever(self.texto_matriz, "\n".join(linhas))
-
-
-def main():
+def main() -> None:
     janela = tk.Tk()
     janela.withdraw()
     try:
         Aplicacao(janela)
-    except (OSError, ValueError, TypeError) as erro:
+    except (OSError, ValueError, TypeError) as e:
         messagebox.showerror(
-            "Erro ao abrir os dados",
-            f"Não foi possível carregar {ARQUIVO_DADOS.name}:\n{erro}\n\n"
-            "Verifique ou renomeie o arquivo para iniciar um cadastro vazio.",
+            "Erro ao abrir dados",
+            f"Não foi possível carregar {ARQUIVO_DADOS.name}:\n{e}\n\n"
+            "Renomeie ou apague o arquivo para iniciar um cadastro novo.",
             parent=janela,
         )
         janela.destroy()

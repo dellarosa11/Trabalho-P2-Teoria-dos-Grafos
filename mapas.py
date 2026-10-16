@@ -19,18 +19,10 @@ class ErroMapa(RuntimeError):
     """Falha ao consultar um dos serviços de mapas."""
 
 
-def _coordenadas(latitude, longitude) -> tuple[float, float]:
-    try:
-        if isinstance(latitude, bool) or isinstance(longitude, bool):
-            raise ValueError
-        latitude, longitude = float(latitude), float(longitude)
-        if not math.isfinite(latitude) or not math.isfinite(longitude):
-            raise ValueError
-        if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
-            raise ValueError
-    except (TypeError, ValueError, OverflowError) as erro:
-        raise ValueError("A cidade precisa ter latitude e longitude válidas.") from erro
-    return latitude, longitude
+from grafo import validar_coordenadas
+
+# Reutiliza a validação unificada de coordenadas (evita código duplicado)
+_coordenadas = validar_coordenadas
 
 
 class ServicoMapas:

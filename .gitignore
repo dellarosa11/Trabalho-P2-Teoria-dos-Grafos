@@ -1,0 +1,11 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Arquivos temporários gerados pelo programa
+rotas_mapa.html
+
+# IDEs e editores
+.vscode/
+.idea/
