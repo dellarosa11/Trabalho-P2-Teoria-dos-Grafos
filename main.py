@@ -1,9 +1,18 @@
 """Sistema de Rotas entre Cidades — Teoria dos Grafos.
 
+Como o programa se organiza:
+  - grafo.py guarda as cidades (vértices), as estradas (arestas) e Dijkstra.
+  - main.py recebe as ações do usuário e apresenta os resultados com Tkinter.
+  - mapas.py consulta dados geográficos e desenha o resultado no navegador.
+
 Abas:
   1. Calcular Rota  — seleciona origem/destino e executa Dijkstra.
   2. Gerenciar      — adiciona/remove cidades e estradas (manual ou via mapa real).
   3. Adjacência     — lista e matriz de adjacência do grafo.
+
+Fluxo de uma busca: botão Calcular Rota -> _calcular_rota ->
+Grafo.menor_rota -> objeto Rota -> texto na tela e, se solicitado, mapa.
+As funções de interface chamam o algoritmo; a implementação dele fica em grafo.py.
 """
 
 from __future__ import annotations
@@ -21,8 +30,11 @@ from grafo import Grafo
 from mapas import ErroMapa, ServicoMapas, ServidorMapa, gerar_mapa
 
 
+# Usa a pasta deste código, mesmo quando o programa é iniciado de outra pasta.
 ARQUIVO_DADOS = Path(__file__).with_name("rotas.json")
 
+# Traduz o texto visível na interface para o atributo da aresta usado como peso.
+# O modelo Grafo também aceita "custo", mas esta interface oferece km e minutos.
 CRITERIOS = {
     "Menor distância (km)": "distancia",
     "Menor tempo (min)":    "tempo",
@@ -36,12 +48,21 @@ UNIDADES = {"distancia": "km", "tempo": "min"}
 # ---------------------------------------------------------------------------
 
 def fmt(valor: float) -> str:
-    """Número com 2 casas decimais no padrão pt-BR (vírgula decimal)."""
+    """Retorna um número como texto com duas casas e vírgula decimal.
+
+    Exemplo: fmt(12.5) produz '12,50'. A formatação é apenas visual;
+    os pesos usados por Dijkstra continuam sendo números no grafo.
+    """
     return f"{valor:.2f}".replace(".", ",")
 
 
 def parse_float(texto: str, campo: str) -> float:
-    """Converte texto com vírgula/ponto para float >= 0 ou levanta ValueError."""
+    """Converte um campo de texto em número finito maior ou igual a zero.
+
+    Aceita vírgula ou ponto decimal. 'campo' identifica o dado na mensagem
+    de ValueError. A exigência de distância/tempo estritamente positivos
+    é feita depois por _salvar_estrada; esta função também aceita zero.
+    """
     try:
         v = float(texto.strip().replace(",", "."))
     except (ValueError, AttributeError, OverflowError):
@@ -52,7 +73,15 @@ def parse_float(texto: str, campo: str) -> float:
 
 
 def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Distância em km entre dois pontos geográficos (linha reta sobre a Terra)."""
+    """Estima a distância em km pela superfície terrestre entre dois pontos.
+
+    Recebe latitude e longitude dos dois pontos em graus. A fórmula de
+    Haversine aproxima a Terra por uma esfera e calcula o arco mais curto
+    entre eles. Não acompanha as rodovias nem executa uma busca no grafo;
+    serve de estimativa quando a consulta rodoviária não funciona.
+    """
+    # Raio médio aproximado da Terra em km. As funções trigonométricas
+    # recebem radianos, por isso os ângulos em graus são convertidos.
     R = 6371.0
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
@@ -65,14 +94,27 @@ def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 # ---------------------------------------------------------------------------
 
 class Aplicacao:
-    """Interface gráfica com 3 abas: Rota | Gerenciar | Adjacência."""
+    """Conecta a janela Tkinter ao grafo, ao arquivo JSON e ao serviço de mapas.
+
+    Cada método associado a um botão lê os campos da tela e chama o modelo
+    Grafo. 'self' é esta instância da aplicação; nomes iniciados com '_'
+    indicam métodos de apoio usados internamente pela interface.
+    """
 
     def __init__(self, janela: tk.Tk, arquivo: Path | str = ARQUIVO_DADOS) -> None:
+        """Carrega o cadastro de 'arquivo', cria as três abas e liga os eventos.
+
+        'janela' é a janela principal já criada por main(). Se não existir
+        arquivo, começa com um grafo vazio. Também prepara o estado das
+        consultas de rede e a rotina de encerramento da aplicação.
+        """
         self.janela = janela
         self.arquivo = Path(arquivo)
         self.grafo = Grafo()
         self.servico_mapas = ServicoMapas()
         self.servidor_mapa: ServidorMapa | None = None
+        # A fila transporta o resultado da busca feita em outra thread até
+        # a interface; a janela consulta a fila sem bloquear o usuário.
         self.fila_mapa: Queue = Queue()
         self.ocupado_mapa = False
         self.ultima_rota = None
@@ -80,6 +122,7 @@ class Aplicacao:
         self._geometria_pendente: tuple | None = None
         self._consulta_estrada_seq = 0
 
+        # de_dict reconstrói o grafo e valida o conteúdo lido do JSON.
         if self.arquivo.exists():
             try:
                 self.grafo = Grafo.de_dict(
@@ -109,23 +152,21 @@ class Aplicacao:
 
         self._seletores: list[ttk.Combobox] = []
 
-        aba_rota   = ttk.Frame(nb, padding=14)
-        aba_ger    = ttk.Frame(nb, padding=14)
-        aba_adj    = ttk.Frame(nb, padding=14)
-
-        nb.add(aba_rota, text="  📍 Calcular Rota  ")
-        nb.add(aba_ger,  text="  🏙️ Gerenciar Cidades e Estradas  ")
-        nb.add(aba_adj,  text="  📊 Adjacência do Grafo  ")
-
-        self._aba_rota(aba_rota)
-        self._aba_gerenciar(aba_ger)
-        self._aba_adjacencia(aba_adj)
+        for titulo, montar in (
+            ("  📍 Calcular Rota  ", self._aba_rota),
+            ("  🏙️ Gerenciar Cidades e Estradas  ", self._aba_gerenciar),
+            ("  📊 Adjacência do Grafo  ", self._aba_adjacencia),
+        ):
+            aba = ttk.Frame(nb, padding=14)
+            nb.add(aba, text=titulo)
+            montar(aba)
 
         # Status bar
         self.status = tk.StringVar()
         ttk.Label(corpo, textvariable=self.status, foreground="#666").pack(anchor="w", pady=(8, 0))
 
         self._atualizar()
+        # Intercepta o X da janela para também encerrar o servidor do mapa.
         janela.protocol("WM_DELETE_WINDOW", self._fechar)
 
     # -----------------------------------------------------------------------
@@ -133,6 +174,7 @@ class Aplicacao:
     # -----------------------------------------------------------------------
 
     def _estilos(self, janela: tk.Tk) -> None:
+        """Define tema, fontes e cores dos componentes da janela recebida."""
         s = ttk.Style(janela)
         s.theme_use("clam")
         s.configure("TLabel",          font=("Segoe UI", 10))
@@ -147,6 +189,11 @@ class Aplicacao:
     # -----------------------------------------------------------------------
 
     def _combobox_cidade(self, pai, label: str, col: int) -> ttk.Combobox:
+        """Cria um seletor de cidades em 'pai' e devolve o componente.
+
+        'label' é o título e 'col' é a coluna no formulário. Guarda o seletor
+        em _seletores para atualizar suas opções quando o grafo mudar.
+        """
         ttk.Label(pai, text=label).grid(row=0, column=col, sticky="w")
         cb = ttk.Combobox(pai, state="readonly", width=22)
         cb.grid(row=1, column=col, sticky="ew", padx=(0, 8), pady=(4, 8))
@@ -155,25 +202,41 @@ class Aplicacao:
         return cb
 
     @staticmethod
-    def _treeview(pai, colunas: dict[str, str], altura: int = 7) -> ttk.Treeview:
+    def _adicionar_rolagem(componente: tk.Text | ttk.Treeview) -> None:
+        """Posiciona o componente e suas barras de rolagem no frame que o contém."""
+        frame = componente.master
+        vertical = ttk.Scrollbar(frame, orient="vertical", command=componente.yview)
+        horizontal = ttk.Scrollbar(frame, orient="horizontal", command=componente.xview)
+        componente.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        componente.grid(row=0, column=0, sticky="nsew")
+        vertical.grid(row=0, column=1, sticky="ns")
+        horizontal.grid(row=1, column=0, sticky="ew")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+
+    @classmethod
+    def _treeview(cls, pai, colunas: dict[str, str], altura: int = 7) -> ttk.Treeview:
+        """Retorna uma tabela rolável dentro do componente 'pai'.
+
+        'colunas' associa os identificadores internos aos títulos visíveis;
+        'altura' indica a quantidade inicial de linhas exibidas.
+        """
         f = ttk.Frame(pai)
         f.pack(fill="both", expand=True)
         tv = ttk.Treeview(f, columns=list(colunas), show="headings", height=altura)
         for k, v in colunas.items():
             tv.heading(k, text=v)
             tv.column(k, width=110, minwidth=60)
-        sv = ttk.Scrollbar(f, orient="vertical",   command=tv.yview)
-        sh = ttk.Scrollbar(f, orient="horizontal",  command=tv.xview)
-        tv.configure(yscrollcommand=sv.set, xscrollcommand=sh.set)
-        tv.grid(row=0, column=0, sticky="nsew")
-        sv.grid(row=0, column=1, sticky="ns")
-        sh.grid(row=1, column=0, sticky="ew")
-        f.rowconfigure(0, weight=1)
-        f.columnconfigure(0, weight=1)
+        cls._adicionar_rolagem(tv)
         return tv
 
-    @staticmethod
-    def _caixa_texto(pai) -> tk.Text:
+    @classmethod
+    def _caixa_texto(cls, pai) -> tk.Text:
+        """Retorna uma caixa de texto rolável, inicialmente somente para leitura.
+
+        É criada dentro de 'pai' e usa fonte monoespaçada para alinhar as
+        colunas da matriz de adjacência e os textos dos resultados.
+        """
         f = ttk.Frame(pai)
         f.pack(fill="both", expand=True, pady=(6, 0))
         t = tk.Text(
@@ -181,29 +244,28 @@ class Aplicacao:
             bg="#ffffff", fg="#172b4d", relief="solid", bd=1,
             padx=8, pady=8, state="disabled",
         )
-        sv = ttk.Scrollbar(f, orient="vertical",   command=t.yview)
-        sh = ttk.Scrollbar(f, orient="horizontal",  command=t.xview)
-        t.configure(yscrollcommand=sv.set, xscrollcommand=sh.set)
-        t.grid(row=0, column=0, sticky="nsew")
-        sv.grid(row=0, column=1, sticky="ns")
-        sh.grid(row=1, column=0, sticky="ew")
-        f.rowconfigure(0, weight=1)
-        f.columnconfigure(0, weight=1)
+        cls._adicionar_rolagem(t)
         return t
 
     @staticmethod
     def _escrever(t: tk.Text, texto: str) -> None:
+        """Substitui o conteúdo de 't' por 'texto' e bloqueia a edição novamente."""
         t.configure(state="normal")
         t.delete("1.0", "end")
         t.insert("1.0", texto)
         t.configure(state="disabled")
 
     # -----------------------------------------------------------------------
-    # ABA 1 — Calcular Rota
+    # ABA 1 — Calcular Rota (Execução do Algoritmo de Dijkstra)
     # -----------------------------------------------------------------------
 
     def _aba_rota(self, pai: ttk.Frame) -> None:
-        # Linha de seletores
+        """Monta em 'pai' os seletores, os botões e a saída da busca de rotas.
+
+        Alterar um seletor apaga o resultado anterior. O botão de cálculo
+        chama _calcular_rota; montar a aba ainda não executa Dijkstra.
+        """
+        # Linha de seletores de cidades e critério
         form = ttk.Frame(pai)
         form.pack(fill="x")
 
@@ -217,6 +279,8 @@ class Aplicacao:
         form.columnconfigure(2, weight=1)
 
         for w in (self.cb_origem, self.cb_destino, self.cb_criterio):
+            # bind registra uma reação a um evento. A lambda recebe o
+            # evento como '_' porque só precisamos chamar _limpar_rota.
             w.bind("<<ComboboxSelected>>", lambda _: self._limpar_rota())
 
         # Botões
@@ -243,6 +307,10 @@ class Aplicacao:
         self.txt_rota = self._caixa_texto(pai)
 
     def _limpar_rota(self) -> None:
+        """Descarta a rota exibida e desabilita seu mapa até um novo cálculo.
+
+        Não remove cidades nem estradas: limpa apenas o resultado da busca.
+        """
         self.ultima_rota = None
         self.btn_ver_mapa.configure(state="disabled")
         if not self.grafo.cidades:
@@ -252,12 +320,24 @@ class Aplicacao:
         self._escrever(self.txt_rota, "")
 
     def _inverter_rota(self) -> None:
+        """Troca origem e destino nos seletores e descarta o resultado anterior.
+
+        Em estradas de mão única, a viagem de volta pode ter outro caminho
+        ou nem existir. Por isso é necessário calcular a rota novamente.
+        """
         a, b = self.cb_origem.get(), self.cb_destino.get()
         self.cb_origem.set(b)
         self.cb_destino.set(a)
         self._limpar_rota()
 
     def _calcular_rota(self) -> None:
+        """Valida a seleção, chama Grafo.menor_rota e apresenta o percurso.
+
+        O critério determina qual peso Dijkstra minimiza: soma das distâncias
+        ou soma dos tempos. Os outros totais descrevem o caminho escolhido,
+        sem necessariamente serem os menores possíveis. None significa
+        que o destino não é alcançável seguindo as estradas cadastradas.
+        """
         self._limpar_rota()
         if len(self.grafo.cidades) < 2:
             messagebox.showwarning(
@@ -277,6 +357,8 @@ class Aplicacao:
 
         criterio = CRITERIOS[self.cb_criterio.get()]
         try:
+            # Este é o ponto em que a interface chama Dijkstra. O algoritmo
+            # está em grafo.py; aqui apenas usamos o objeto Rota devolvido.
             rota = self.grafo.menor_rota(origem, destino, criterio)
         except ValueError as e:
             messagebox.showerror("Erro", str(e), parent=self.janela)
@@ -300,17 +382,22 @@ class Aplicacao:
             f"Passo a passo:\n"
             + "\n".join(f"  {i}. {c}" for i, c in enumerate(rota.cidades, 1)),
         )
+        # O "Passo a passo" exibido enumera as cidades da rota final;
+        # não é um registro de todas as explorações feitas por Dijkstra.
 
     # -----------------------------------------------------------------------
     # ABA 2 — Gerenciar Cidades e Estradas
-    # (inclui busca de cidades reais e importação de trajetos)
+    # (Cadastro manual, busca no OpenStreetMap e medição automática via OSRM)
     # -----------------------------------------------------------------------
 
     def _aba_gerenciar(self, pai: ttk.Frame) -> None:
         """
-        Aba unificada dividida em três seções na vertical:
-          A) Cidades (lista + adicionar/remover + busca real)
-          B) Estradas (formulário + lista)
+        Monta em 'pai' os formulários de edição dos vértices e das arestas.
+
+        O painel esquerdo cadastra cidades por nome ou por busca geográfica.
+        O direito edita as estradas, seus pesos e a permissão de ida e volta.
+        Os botões chamam outros métodos; a gravação fica concentrada em
+        _salvar para manter o grafo em memória e o JSON sincronizados.
         """
         # Painel dividido em esquerda (cidades) e direita (estradas)
         painel = ttk.Frame(pai)
@@ -400,6 +487,8 @@ class Aplicacao:
         self.lbl_dica_dist.pack(anchor="w", pady=(0, 4))
 
         self.var_maodupla = tk.BooleanVar(value=True)
+        # Esta opção define se a aresta pode ser percorrida nos dois
+        # sentidos. Se desmarcada, existe somente origem -> destino.
         ttk.Checkbutton(dir, text="Estrada de mão dupla (ida e volta)",
                         variable=self.var_maodupla).pack(anchor="w", pady=(0, 6))
 
@@ -424,6 +513,12 @@ class Aplicacao:
     # ─── Cidades (manual) ────────────────────────────────────────────────────
 
     def _add_cidade(self) -> None:
+        """Cadastra pelo nome um vértice, inicialmente sem coordenadas.
+
+        _salvar aplica a inclusão em uma cópia do grafo e grava o resultado.
+        O vértice já pode participar de rotas com estradas cadastradas
+        manualmente, mesmo sem ter uma posição para exibir no mapa.
+        """
         nome = self.ent_cidade.get().strip()
         if not nome:
             messagebox.showwarning("Atenção", "Digite o nome da cidade.", parent=self.janela)
@@ -433,6 +528,11 @@ class Aplicacao:
             self.ent_cidade.focus_set()
 
     def _rem_cidade(self) -> None:
+        """Pede confirmação e exclui o vértice selecionado e suas arestas.
+
+        Grafo.remover_cidade apaga tanto as conexões de saída quanto as de
+        entrada, para nenhuma estrada continuar apontando à cidade removida.
+        """
         sel = self.tv_cidades.selection()
         if not sel:
             messagebox.showinfo("Excluir", "Selecione uma cidade na lista.", parent=self.janela)
@@ -446,6 +546,7 @@ class Aplicacao:
             self._salvar(lambda g: g.remover_cidade(cidade))
 
     def _zerar(self) -> None:
+        """Pede confirmação para esvaziar o grafo e persistir o cadastro vazio."""
         if not self.grafo.cidades:
             messagebox.showinfo("Aviso", "O cadastro já está vazio.", parent=self.janela)
             return
@@ -460,7 +561,13 @@ class Aplicacao:
     # ─── Busca de cidades reais ───────────────────────────────────────────────
 
     def _tarefa_rede(self, tarefa, ao_concluir) -> None:
-        """Executa tarefa de rede em segundo plano sem travar a UI."""
+        """Executa 'tarefa()' fora da interface e entrega o resultado a 'ao_concluir'.
+
+        Uma thread faz a consulta e coloca resultado ou erro na fila.
+        A janela verifica a fila periodicamente com after(), mantendo a
+        interface responsiva. Enquanto essa tarefa está ativa, os botões
+        de busca ficam bloqueados para evitar buscas sobrepostas por aqui.
+        """
         if self.ocupado_mapa:
             return
         self.ocupado_mapa = True
@@ -468,15 +575,19 @@ class Aplicacao:
             b.configure(state="disabled")
 
         def run():
+            """Produz na thread um par (resultado, erro) para a fila da janela."""
             try:
                 self.fila_mapa.put((tarefa(), None))
             except Exception as e:
                 self.fila_mapa.put((None, e))
 
         def poll():
+            """Verifica a fila sem esperar e atualiza a interface ao obter a resposta."""
             try:
                 resultado, erro = self.fila_mapa.get_nowait()
             except Empty:
+                # Agenda uma nova verificação em 100 ms; não usa uma espera
+                # bloqueante que impediria a janela de processar eventos.
                 self.janela.after(100, poll)
                 return
             self.ocupado_mapa = False
@@ -491,6 +602,11 @@ class Aplicacao:
         self.janela.after(100, poll)
 
     def _buscar_cidade(self) -> None:
+        """Envia o nome digitado ao serviço Photon e lista as sugestões recebidas.
+
+        A consulta obtém nomes e coordenadas; não inclui cidades no grafo
+        até o usuário selecionar um resultado e chamar _add_cidade_real.
+        """
         consulta = self.ent_busca.get().strip()
         if len(consulta) < 2:
             self.var_status_busca.set("Digite ao menos 2 caracteres para buscar.")
@@ -500,6 +616,7 @@ class Aplicacao:
         self.var_status_busca.set("Buscando…")
 
         def mostrar(cidades: list[dict]):
+            """Preenche a tabela e associa o identificador da linha à sugestão original."""
             self.resultados_busca = cidades
             for i, c in enumerate(cidades):
                 self.tv_busca.insert("", "end", iid=str(i), values=(c["nome"],))
@@ -510,6 +627,12 @@ class Aplicacao:
         self._tarefa_rede(lambda: self.servico_mapas.buscar_cidades(consulta), mostrar)
 
     def _add_cidade_real(self) -> None:
+        """Cadastra a sugestão selecionada com sua latitude e longitude.
+
+        Se o nome já existir, atualiza suas coordenadas. Ter coordenadas
+        permite medir rodovias e exibir o vértice no mapa, mas não cria
+        automaticamente arestas ligando essa cidade às demais.
+        """
         sel = self.tv_busca.selection()
         if not sel:
             self.var_status_busca.set("Selecione uma cidade nos resultados.")
@@ -518,10 +641,25 @@ class Aplicacao:
         if self._salvar(lambda g: g.adicionar_ou_atualizar_cidade(c["nome"], c["latitude"], c["longitude"])):
             self.var_status_busca.set(f"'{c['nome']}' adicionada ao grafo!")
 
-    # ─── Estradas ────────────────────────────────────────────────────────────
+    # ─── Estradas e Medição Automática ───────────────────────────────────────
+
+    def _preencher_pesos(self, distancia: str = "", tempo: str = "") -> None:
+        """Substitui os textos dos pesos; sem argumentos, limpa os dois campos."""
+        for chave, texto in (("distancia", distancia), ("tempo", tempo)):
+            campo = self._campos_peso[chave]
+            campo.delete(0, "end")
+            campo.insert(0, texto)
 
     def _auto_preencher_estrada(self) -> None:
-        """Consulta e preenche a distância real por rodovias (OSRM) ao escolher origem e destino."""
+        """
+        Consulta o OSRM em outra thread e preenche os pesos do formulário.
+
+        Usa as coordenadas das cidades selecionadas para obter distância
+        rodoviária em km, duração estimada em minutos e pontos da estrada.
+        Se a consulta falhar, estima a distância com Haversine e o tempo
+        supondo 80 km/h. Ainda é necessário salvar a estrada para que
+        esses dados virem uma aresta usada pelo Dijkstra local.
+        """
         orig, dest = self.cb_est_orig.get(), self.cb_est_dest.get()
         if not orig or not dest or orig == dest:
             return
@@ -538,6 +676,7 @@ class Aplicacao:
         lat1, lon1 = coords[orig]
         lat2, lon2 = coords[dest]
 
+        # Controle de sequência para evitar que respostas antigas sobrescrevam seleções novas
         self._consulta_estrada_seq += 1
         seq_atual = self._consulta_estrada_seq
         self._geometria_pendente = None
@@ -548,6 +687,7 @@ class Aplicacao:
         )
 
         def buscar():
+            """Consulta a rodovia e agenda a entrega do resultado à janela."""
             try:
                 dados = self.servico_mapas.consultar_estrada(
                     {"latitude": lat1, "longitude": lon1},
@@ -559,6 +699,9 @@ class Aplicacao:
                 erro = e
 
             def atualizar_ui():
+                """Preenche os campos apenas se a resposta ainda corresponder à seleção atual."""
+                # A rede pode responder fora da ordem de envio. Uma resposta
+                # antiga não deve preencher o formulário de outro par de cidades.
                 if seq_atual != self._consulta_estrada_seq:
                     return
                 if self.cb_est_orig.get() != orig or self.cb_est_dest.get() != dest:
@@ -569,23 +712,19 @@ class Aplicacao:
                     tempo_min = round(dados["tempo"], 1)
                     self._geometria_pendente = dados.get("geometria")
 
-                    for campo in self._campos_peso.values():
-                        campo.delete(0, "end")
-                    self._campos_peso["distancia"].insert(0, fmt(dist_km))
-                    self._campos_peso["tempo"].insert(0, fmt(tempo_min))
+                    self._preencher_pesos(fmt(dist_km), fmt(tempo_min))
 
                     self.lbl_dica_dist.configure(
                         text=f"🛣️ Estrada real: {fmt(dist_km)} km • Tempo estimado: {fmt(tempo_min)} min (via rodovias).",
                         foreground="#1a7a1a",
                     )
                 else:
+                    # Estimativa geográfica, sem considerar curvas ou desvios
+                    # das rodovias. O tempo assume velocidade constante de 80 km/h.
                     dist_reta = round(haversine(lat1, lon1, lat2, lon2), 2)
                     tempo_reta = round(dist_reta / 80 * 60, 1)
 
-                    for campo in self._campos_peso.values():
-                        campo.delete(0, "end")
-                    self._campos_peso["distancia"].insert(0, fmt(dist_reta))
-                    self._campos_peso["tempo"].insert(0, fmt(tempo_reta))
+                    self._preencher_pesos(fmt(dist_reta), fmt(tempo_reta))
 
                     msg_err = str(erro) if erro else "serviço indisponível"
                     self.lbl_dica_dist.configure(
@@ -598,6 +737,13 @@ class Aplicacao:
         Thread(target=buscar, daemon=True).start()
 
     def _salvar_estrada(self) -> None:
+        """Valida os campos e grava uma aresta entre as cidades selecionadas.
+
+        Os pesos podem ter sido digitados ou preenchidos pela consulta.
+        Sem tempo informado, estima 1 min/km. A geometria serve ao desenho;
+        os pesos distância e tempo são os números usados na busca de rotas.
+        A opção de mão dupla determina os sentidos permitidos no grafo.
+        """
         orig, dest = self.cb_est_orig.get(), self.cb_est_dest.get()
         if not orig or not dest:
             messagebox.showwarning("Atenção", "Selecione origem e destino.", parent=self.janela)
@@ -608,7 +754,8 @@ class Aplicacao:
 
         txt_d = self._campos_peso["distancia"].get().strip()
         if not txt_d:
-            # Tenta calcular automaticamente antes de reclamar
+            # Solicita o preenchimento automático. Como a consulta é
+            # assíncrona, ela pode terminar apenas após esta tentativa de salvar.
             self._auto_preencher_estrada()
             txt_d = self._campos_peso["distancia"].get().strip()
         if not txt_d:
@@ -624,25 +771,22 @@ class Aplicacao:
             dist = parse_float(txt_d, "distância")
             if dist <= 0:
                 raise ValueError("A distância deve ser maior que zero.")
+            # Tempo opcional: aqui a estimativa é 1 min/km (equivale a 60 km/h).
+            # É uma regra diferente dos 80 km/h usados no fallback da consulta.
+            txt_t = self._campos_peso["tempo"].get().strip()
+            if txt_t:
+                tempo = parse_float(txt_t, "tempo")
+                if tempo <= 0:
+                    raise ValueError("O tempo deve ser maior que zero.")
+            else:
+                tempo = round(dist, 1)
+                self._campos_peso["tempo"].delete(0, "end")
+                self._campos_peso["tempo"].insert(0, fmt(tempo))
         except ValueError as e:
             messagebox.showerror("Valor inválido", str(e), parent=self.janela)
             return
 
-        # Tempo: opcional (estimativa 1 min/km)
-        txt_t = self._campos_peso["tempo"].get().strip()
-        if txt_t:
-            try:
-                tempo = parse_float(txt_t, "tempo")
-                if tempo <= 0:
-                    raise ValueError("O tempo deve ser maior que zero.")
-            except ValueError as e:
-                messagebox.showerror("Valor inválido", str(e), parent=self.janela)
-                return
-        else:
-            tempo = round(dist, 1)
-            self._campos_peso["tempo"].delete(0, "end")
-            self._campos_peso["tempo"].insert(0, fmt(tempo))
-
+        # Recupera a geometria das curvas gravada na medição do OSRM
         geo = self._geometria_pendente or self.grafo.obter_geometria(orig, dest)
         if self._salvar(
             lambda g: g.adicionar_estrada(
@@ -650,10 +794,14 @@ class Aplicacao:
                 bidirecional=self.var_maodupla.get(), geometria=geo,
             )
         ):
-            self._geometria_pendente = None
             self._limpar_campos_estrada()
 
     def _rem_estrada(self) -> None:
+        """Pede confirmação e remove a aresta selecionada no cadastro.
+
+        Uma estrada bidirecional tem as duas conexões removidas pelo grafo;
+        uma de mão única remove apenas o sentido cadastrado.
+        """
         sel = self.tv_estradas.selection()
         if not sel:
             messagebox.showinfo("Excluir", "Selecione uma estrada na lista.", parent=self.janela)
@@ -664,13 +812,21 @@ class Aplicacao:
             self._limpar_campos_estrada()
 
     def _limpar_campos_estrada(self) -> None:
+        """Limpa pesos, geometria pendente e seleção, restaurando a opção de mão dupla.
+
+        Não apaga estradas do grafo; prepara o formulário para outra edição.
+        """
         self._geometria_pendente = None
         self.tv_estradas.selection_remove(*self.tv_estradas.selection())
-        for campo in self._campos_peso.values():
-            campo.delete(0, "end")
+        self._preencher_pesos()
         self.var_maodupla.set(True)
 
     def _sel_estrada(self, _=None) -> None:
+        """Copia os dados da estrada selecionada para os campos de edição.
+
+        '_' recebe o evento do Treeview, cujo conteúdo não é necessário.
+        O identificador da linha é o índice da estrada na lista ordenada.
+        """
         sel = self.tv_estradas.selection()
         if not sel:
             return
@@ -678,15 +834,21 @@ class Aplicacao:
         self.cb_est_orig.set(e.origem)
         self.cb_est_dest.set(e.destino)
         self.var_maodupla.set(e.bidirecional)
-        for k, campo in self._campos_peso.items():
-            campo.delete(0, "end")
-            campo.insert(0, str(getattr(e, k)).replace(".", ","))
+        self._preencher_pesos(
+            str(e.distancia).replace(".", ","), str(e.tempo).replace(".", ","),
+        )
 
     # -----------------------------------------------------------------------
-    # ABA 3 — Adjacência
+    # ABA 3 — Adjacência (Representação Matemática)
     # -----------------------------------------------------------------------
 
     def _aba_adjacencia(self, pai: ttk.Frame) -> None:
+        """Cria em 'pai' duas visualizações das conexões diretas do mesmo grafo.
+
+        A lista enumera os vizinhos de cada cidade; a matriz cruza todas as
+        origens e destinos. O seletor escolhe se o peso mostrado é distância
+        ou tempo. São representações dos dados, sem executar Dijkstra.
+        """
         crit_f = ttk.Frame(pai)
         crit_f.pack(fill="x", pady=(0, 6))
         ttk.Label(crit_f, text="Peso exibido:").pack(side="left", padx=(0, 6))
@@ -713,11 +875,18 @@ class Aplicacao:
         self.txt_matriz = self._caixa_texto(matriz_f)
 
     # -----------------------------------------------------------------------
-    # Mapa
+    # Mapa Interativo no Navegador
     # -----------------------------------------------------------------------
 
     def _abrir_mapa(self, rota=None) -> None:
-        if rota and any(c not in self.grafo.coordenadas for c in rota.cidades):
+        """Abre o mapa do grafo no navegador, destacando 'rota' quando fornecida.
+
+        gerar_mapa monta o HTML e ServidorMapa o disponibiliza em endereço
+        local. Sem rota, mostra o cadastro geral. Coordenadas são necessárias
+        para posicionar cidades; esta função não calcula outro caminho.
+        """
+        coordenadas = self.grafo.coordenadas
+        if rota and any(c not in coordenadas for c in rota.cidades):
             messagebox.showinfo(
                 "Mapa",
                 "Algumas cidades da rota não têm coordenadas. "
@@ -739,13 +908,25 @@ class Aplicacao:
     # -----------------------------------------------------------------------
 
     def _salvar(self, alterar) -> bool:
-        """Aplica `alterar(grafo_cópia)` e grava o JSON atomicamente."""
+        """
+        Aplica 'alterar(grafo_copia)' e salva o cadastro, retornando sucesso.
+
+        'alterar' é uma função recebida como argumento, por exemplo uma
+        lambda que adiciona uma cidade. Faz a mudança numa cópia validada,
+        escreve um arquivo temporário e substitui o JSON por ele. Só então
+        troca o grafo da aplicação e atualiza a tela. Em caso de ValueError
+        ou OSError, exibe o erro e retorna False sem trocar o grafo em memória.
+        """
         try:
+            # Serializar e reconstruir cria uma cópia independente do modelo.
+            # Assim, uma alteração rejeitada não modifica o cadastro em uso.
             copia = Grafo.de_dict(self.grafo.para_dict())
             alterar(copia)
             conteudo = json.dumps(copia.para_dict(), ensure_ascii=False, indent=2, allow_nan=False)
             tmp = self.arquivo.with_suffix(".tmp")
             tmp.write_text(conteudo, encoding="utf-8")
+            # Substituir o arquivo pronto evita gravar o JSON definitivo
+            # parcialmente; isso não equivale a uma garantia contra toda falha de disco.
             tmp.replace(self.arquivo)
         except (ValueError, OSError) as e:
             messagebox.showerror("Erro ao salvar", str(e), parent=self.janela)
@@ -755,8 +936,15 @@ class Aplicacao:
         return True
 
     def _atualizar(self) -> None:
-        """Sincroniza toda a interface com o estado atual do grafo."""
+        """
+        Sincroniza seletores, tabelas, status e adjacência com o grafo atual.
+
+        É chamada na abertura e após um salvamento bem-sucedido. Descarta
+        o resultado anterior de Dijkstra, pois mudar vértices, arestas ou
+        pesos pode tornar aquela rota inválida ou deixar de ser a melhor.
+        """
         cidades = self.grafo.cidades
+        estradas = self.grafo.estradas
 
         # Comboboxes de seleção de cidade
         for cb in self._seletores:
@@ -772,7 +960,7 @@ class Aplicacao:
 
         # Tabela de estradas
         self.tv_estradas.delete(*self.tv_estradas.get_children())
-        for idx, e in enumerate(self.grafo.estradas):
+        for idx, e in enumerate(estradas):
             sentido = "↔ Ida e volta" if e.bidirecional else "→ Só ida"
             self.tv_estradas.insert("", "end", iid=str(idx), values=(
                 e.origem, e.destino,
@@ -783,7 +971,7 @@ class Aplicacao:
         # Status bar
         if cidades:
             self.status.set(
-                f"{len(cidades)} cidade(s) • {len(self.grafo.estradas)} estrada(s) • {self.arquivo.name}"
+                f"{len(cidades)} cidade(s) • {len(estradas)} estrada(s) • {self.arquivo.name}"
             )
         else:
             self.status.set(
@@ -794,10 +982,18 @@ class Aplicacao:
         self._atualizar_adjacencia()
 
     def _atualizar_adjacencia(self) -> None:
+        """Formata a lista e a matriz usando o peso escolhido pelo usuário.
+
+        A célula [origem][destino] contém o peso de uma estrada direta, 0
+        na diagonal e infinito quando não existe essa conexão direta.
+        Infinito não impede que exista uma rota passando por outras cidades.
+        Não é uma matriz de menores caminhos: esses são calculados por Dijkstra.
+        """
         criterio = CRITERIOS[self.cb_adj_criterio.get()]
         unidade  = UNIDADES[criterio]
 
-        # Lista
+        # Lista de adjacência: mostra apenas os vizinhos alcançáveis por
+        # uma aresta de saída, respeitando as estradas de mão única.
         lista = self.grafo.lista_adjacencia(criterio)
         linhas = [
             f"• {cidade}:\n   ↳ " + (
@@ -812,13 +1008,16 @@ class Aplicacao:
             + ("\n\n".join(linhas) if linhas else "Nenhuma cidade cadastrada."),
         )
 
-        # Matriz
+        # Matriz de adjacência: cidades dá a ordem comum de linhas e colunas.
+        # Estradas de mão única podem tornar a matriz assimétrica.
         cidades, matriz = self.grafo.matriz_adjacencia(criterio)
         if not cidades:
             self._escrever(self.txt_matriz, "Nenhuma cidade cadastrada.")
             return
 
         vals = [["∞" if math.isinf(p) else fmt(p) for p in row] for row in matriz]
+        # A largura considera nomes e valores para alinhar a tabela na
+        # fonte monoespaçada da caixa de texto, mesmo com cidades de nomes longos.
         col_w = max(8, *(len(c) for c in cidades), *(len(v) for row in vals for v in row)) + 2
         cab = " " * col_w + "".join(c.rjust(col_w) for c in cidades)
         sep = "-" * len(cab)
@@ -829,16 +1028,22 @@ class Aplicacao:
         )
 
     def _fechar(self) -> None:
+        """Encerra o servidor de mapa, se houver, e destrói a janela principal."""
         if self.servidor_mapa:
             self.servidor_mapa.fechar()
         self.janela.destroy()
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Ponto de entrada do programa (Main)
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    """Cria a janela, inicializa Aplicacao e inicia o laço de eventos do Tkinter.
+
+    A janela fica oculta durante a montagem. mainloop() passa a processar
+    cliques, teclas e rotinas agendadas até o encerramento da aplicação.
+    """
     janela = tk.Tk()
     janela.withdraw()
     try:
@@ -857,4 +1062,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # Abre a interface quando este arquivo é executado diretamente;
+    # importar main.py em outro módulo apenas disponibiliza suas definições.
     main()
